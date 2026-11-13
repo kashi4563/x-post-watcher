@@ -9,11 +9,11 @@ GitHub Actions 上で定期実行されることを想定した、標準ライ�
   X_BEARER_TOKEN       X API の Bearer Token
   DISCORD_WEBHOOK_URL  Discord チャンネルの Webhook URL
   X_USERNAMES          監視するアカウント（カンマ区切り、@なし）
-                       未設定の場合は OnceHuman_JP のみ
+  未設定の場合は OnceHuman_JP のみ
 
 状態は state.json に保存します:
-  - 初回実行時は「基準登録」だけを行い、既存のポストは流しません。
-  - 2回目以降、新しいポストだけを古い順に Discord へ送ります。
+- 初回実行時は「基準登録」だけを行い、既存のポストは流しません。
+- 2回目以降、新しいポストだけを古い順に Discord へ送ります。
 """
 
 import json
@@ -36,7 +36,7 @@ def api_get(path, token):
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as res:
-            return json.loads(res.read().decode("utf-8"))
+            return json.load(res)
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"X API エラー (HTTP {e.code}): {body}") from e
@@ -47,130 +47,130 @@ def post_to_discord(webhook_url, payload):
     req = urllib.request.Request(
         webhook_url,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/130.0.0.0 Safari/537.36"
+            ),
+        },
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as res:
-            return res.status
+            return res
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"Discord Webhook エラー (HTTP {e.code}): {body}") from e
 
 
+def fetch_latest_posts(username, token):
+    url = f"/users/by/username/{username}?user.fields=id,username"
+    user = api_get(url, token)
+    user_id = user.get("data", {}).get("id")
+    if not user_id:
+        raise RuntimeError(f"ユーザーIDの取得に失敗しました: {username}")
+
+    # 最新の投稿を最大5件取得。まるごと表示代
+    tweets = api_get(
+        f"/users/{user_id}/tweets?max_results=5&tweet.fields=created_at,text",
+        token,
+    )
+    items = tweets.get("data", []) or []
+    return [{"id": t["id"], "text": t.get("text", ""), "created_at": t.get("created_at")} for t in items]
+
+
 def load_state():
-    if os.path.exists(STATE_PATH):
-        with open(STATE_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    return {"users": {}}
+    if not os.path.exists(STATE_PATH):
+        return {}
+    with open(STATE_PATH, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def save_state(state):
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
-        f.write("\n")
 
 
-def build_embed(username, display_name, tweet, media_by_key):
-    text = tweet.get("text", "")
-    if len(text) > 4000:
-        text = text[:4000] + "…"
-    url = f"https://x.com/{username}/status/{tweet['id']}"
-    embed = {
-        "title": f"{display_name}（@{username}）の新規ポスト",
+def format_time(created_at):
+    if not created_at:
+        return ""
+    dt = datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+    jst = dt.astimezone(timezone.utc)  # device timezone
+    return jst.strftime("%Y-%m-%d %H:%M:%S") + " JST"
+
+
+def make_embed(author, text, created_at, url):
+    return {
+        "title": f"{author} の新規ポスト",
         "description": text,
         "url": url,
-        "color": 0x1D9BF0,
+        "color": 0xFF0000,
+        "timestamp": datetime.fromisoformat(created_at.replace("Z", "+00:00")).isoformat(),
+        "footer": {"text": f"投稿時刻: {format_time(created_at)}"},
     }
-    for key in tweet.get("attachments", {}).get("media_keys", []):
-        media = media_by_key.get(key, {})
-        if media.get("type") == "photo" and media.get("url"):
-            embed["image"] = {"url": media["url"]}
-            break
-        if media.get("type") in ("video", "animated_gif") and media.get("preview_image_url"):
-            embed["image"] = {"url": media["preview_image_url"]}
-            break
-    return embed
 
 
 def check_user(username, entry, token, webhook_url):
-    """1アカウント分をチェックし、新規ポストがあれば Discord へ送る。"""
-    if not entry.get("id"):
-        res = api_get(f"/users/by/username/{username}", token)
-        if "data" not in res:
-            print(f"[{username}] ユーザーが見つかりませんでした")
-            return
-        entry["id"] = res["data"]["id"]
-        entry["display_name"] = res["data"].get("name", username)
-        print(f"[{username}] ユーザーID を登録しました: {entry['id']}")
+    posts = fetch_latest_posts(username, token)
+    if not entry:
+        # 初回: 最新の投稿を基準として保存するだけ
+        if posts:
+            entry = {"seen_id": posts[0]["id"]}
+            print(f"[{username}] 初回基準登録: {posts[0]['id']}")
+        else:
+            entry = {"seen_id": None}
+            print(f"[{username}] 初回基準登録: 投稿なし")
+        return entry
 
-    user_id = entry["id"]
-    display_name = entry.get("display_name", username)
-    query = (
-        f"/users/{user_id}/tweets?max_results=5&exclude=replies"
-        "&tweet.fields=created_at"
-        "&expansions=attachments.media_keys"
-        "&media.fields=type,url,preview_image_url"
-    )
-    res = api_get(query, token)
-    tweets = sorted(res.get("data", []), key=lambda t: int(t["id"]))
-    if not tweets:
-        print(f"[{username}] 取得できたポストがありません")
-        return
+    seen_id = entry.get("seen_id")
+    if seen_id is None:
+        print(f"[{username}] seen_id なし: 基準登録しません")
+        return entry
 
-    last_seen = entry.get("last_seen_id")
-    if last_seen is None:
-        entry["last_seen_id"] = tweets[-1]["id"]
-        print(f"[{username}] 初回実行: 基準を最新ポスト {tweets[-1]['id']} に設定しました")
-        return
-
-    media_by_key = {
-        m["media_key"]: m for m in res.get("includes", {}).get("media", [])
-    }
-    new_tweets = [t for t in tweets if int(t["id"]) > int(last_seen)]
-    if not new_tweets:
+    new_posts = [p for p in posts if p["id"] > seen_id]
+    if not new_posts:
         print(f"[{username}] 新規ポストなし")
-        return
+        return entry
 
-    for tweet in new_tweets:
-        embed = build_embed(username, display_name, tweet, media_by_key)
+    # 古い順に Discord へ送る
+    for post in reversed(new_posts):
+        url = f"https://x.com/{username}/status/{post['id']}"
+        print(f"[{username}] 新規ポスト送信: {post['id']}")
+        embed = make_embed(username, post["text"], post.get("created_at"), url)
         post_to_discord(
             webhook_url,
             {"username": "公式ポスト検知", "embeds": [embed]},
         )
-        entry["last_seen_id"] = tweet["id"]
-        print(f"[{username}] 投稿しました: https://x.com/{username}/status/{tweet['id']}")
         time.sleep(1)
+
+    entry = {"seen_id": posts[0]["id"]}
+    return entry
 
 
 def main():
-    token = os.environ.get("X_BEARER_TOKEN", "").strip()
-    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-    raw_names = os.environ.get("X_USERNAMES") or DEFAULT_USERNAMES
-    usernames = [
-        u.strip().lstrip("@") for u in raw_names.split(",") if u.strip()
-    ]
-
-    if not token:
-        print("エラー: 環境変数 X_BEARER_TOKEN が設定されていません", file=sys.stderr)
-        return 1
-    if not webhook_url:
-        print("エラー: 環境変数 DISCORD_WEBHOOK_URL が設定されていません", file=sys.stderr)
-        return 1
-    if not usernames:
-        print("エラー: 監視アカウントが空です", file=sys.stderr)
-        return 1
+    token = os.environ.get("X_BEARER_TOKEN")
+    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
+    usernames = [u.strip() for u in os.environ.get("X_USERNAMES", DEFAULT_USERNAMES).split(",") if u.strip()]
+    missing = [k for k, v in [("X_BEARER_TOKEN", token), ("DISCORD_WEBHOOK_URL", webhook_url)] if not v]
+    if missing:
+        raise RuntimeError(f"必要な環境変数が設定されていません: {', '.join(missing)}")
 
     state = load_state()
-    users = state.setdefault("users", {})
+    changed = False
     for username in usernames:
-        entry = users.setdefault(username, {})
-        check_user(username, entry, token, webhook_url)
+        entry = state.get(username)
+        new_entry = check_user(username, entry, token, webhook_url)
+        if new_entry != entry:
+            state[username] = new_entry
+            changed = True
 
-    # チェック時刻を毎回更新する（state.json が変わることで
-    # リポジトリが活動中になり、スケジュールの自動無効化を防ぐ）
-    state["last_check_utc"] = datetime.now(timezone.utc).isoformat()
-    save_state(state)
-    print("完了")
+    if changed:
+        save_state(state)
+        print("state.jsonを保存しました")
+    else:
+        print("変更なし")
+
     return 0
 
 
