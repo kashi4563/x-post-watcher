@@ -174,7 +174,7 @@ def main():
         check_user(username, entry, token, webhook_url)
 
     # チェック時刻を毎回更新する（state.json が変わることで
-    # リポジトリが活動中になり、スケジュールの自動無効化を防ぐ)
+    # リポジトリが活動中になり、スケジュールの自動無効化を防ぐ）
     state["last_check_utc"] = datetime.now(timezone.utc).isoformat()
     save_state(state)
     print("完了")
