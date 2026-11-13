@@ -100,7 +100,7 @@ def build_embed(username, display_name, tweet, media_by_key):
 
 
 def check_user(username, entry, token, webhook_url):
-    """アカウントをチェックし、新規ポストがあれば Discord へ送る。"""
+    """1アカウント分をチェックし、新規ポストがあれば Discord へ送る。"""
     if not entry.get("id"):
         res = api_get(f"/users/by/username/{username}", token)
         if "data" not in res:
@@ -173,7 +173,7 @@ def main():
         entry = users.setdefault(username, {})
         check_user(username, entry, token, webhook_url)
 
-    # チェック時刻を毎回更新する (state.json が変わることで
+    # チェック時刻を毎回更新する（state.json が変わることで
     # リポジトリが活動中になり、スケジュールの自動無効化を防ぐ)
     state["last_check_utc"] = datetime.now(timezone.utc).isoformat()
     save_state(state)
